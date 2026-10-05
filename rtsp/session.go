@@ -13,6 +13,7 @@ const (
 	stateInit sessionState = iota
 	stateReady
 	statePlaying
+	stateRecording
 )
 
 func (s sessionState) String() string {
@@ -21,9 +22,20 @@ func (s sessionState) String() string {
 		return "READY"
 	case statePlaying:
 		return "PLAYING"
+	case stateRecording:
+		return "RECORDING"
 	}
 	return "INIT"
 }
+
+// sessionMode distinguishes a media-receiving session (demo file or live
+// listener) from a live publishing session.
+type sessionMode int
+
+const (
+	modePlay sessionMode = iota
+	modeRecord
+)
 
 // Session is a per-connection exclusive RTSP session.
 type Session struct {
@@ -31,6 +43,7 @@ type Session struct {
 
 	mu          sync.Mutex
 	state       sessionState
+	mode        sessionMode
 	rtpChannel  int
 	rtcpChannel int
 
@@ -39,9 +52,12 @@ type Session struct {
 	rtpTime     uint32
 	sentSamples uint64 // total samples packetized; drives the RTP timestamp
 
-	pos     int // file cursor in samples
-	stream  *streamer
-	onClose func()
+	pos    int // file cursor in samples
+	stream *streamer
+
+	// Live publishing/listening state (nil for /demo sessions).
+	live     *liveSource   // source this session publishes to or listens on
+	listener *liveListener // non-nil while a live PLAY is delivering
 }
 
 func newSession() *Session {

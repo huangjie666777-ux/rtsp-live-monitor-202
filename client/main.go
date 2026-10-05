@@ -136,8 +136,16 @@ func collectRTP(frames <-chan []byte, d time.Duration, label string) (count int,
 
 func main() {
 	addr := "127.0.0.1:8554"
-	if len(os.Args) > 1 {
-		addr = os.Args[1]
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "-live" {
+		if len(args) > 1 {
+			addr = args[1]
+		}
+		liveDemo(addr)
+		return
+	}
+	if len(args) > 0 {
+		addr = args[0]
 	}
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {

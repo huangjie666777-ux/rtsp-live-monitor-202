@@ -30,38 +30,64 @@ func (r *Request) Header(name string) string {
 
 func (r *Request) CSeq() string { return r.Header("cseq") }
 
+// frame is an interleaved '$' binary frame (RTP/RTCP over TCP).
+type frame struct {
+	channel byte
+	payload []byte
+}
+
+// readMessage reads the next message on the connection: either an RTSP
+// request or an interleaved '$' frame. Exactly one of the return values
+// is non-nil. Half packets, pipelined requests and Content-Length bodies
+// are handled without breaking message boundaries.
+func readMessage(r *bufio.Reader) (*Request, *frame, error) {
+	b, err := r.ReadByte()
+	if err != nil {
+		return nil, nil, err
+	}
+	if b == '$' {
+		fr, err := readInterleavedFrame(r)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, fr, nil
+	}
+	req, err := readRequestHead(r, b)
+	if err != nil {
+		return nil, nil, err
+	}
+	return req, nil, nil
+}
+
 // readRequest reads one RTSP request, transparently skipping interleaved
-// '$' binary frames (RTP/RTCP over TCP). Half packets, pipelined requests
-// and Content-Length bodies are handled without breaking message boundaries.
+// '$' binary frames.
 func readRequest(r *bufio.Reader) (*Request, error) {
 	for {
-		b, err := r.ReadByte()
+		req, fr, err := readMessage(r)
 		if err != nil {
 			return nil, err
 		}
-		if b == '$' {
-			if err := skipInterleavedFrame(r); err != nil {
-				return nil, err
-			}
-			continue
+		if fr == nil {
+			return req, nil
 		}
-		return readRequestHead(r, b)
 	}
 }
 
-// skipInterleavedFrame consumes one '$' <channel> <len:2> <payload> frame.
-func skipInterleavedFrame(r *bufio.Reader) error {
+// readInterleavedFrame consumes one '$' <channel> <len:2> <payload> frame.
+func readInterleavedFrame(r *bufio.Reader) (*frame, error) {
 	hdr := make([]byte, 3)
 	if _, err := io.ReadFull(r, hdr); err != nil {
-		return err
+		return nil, err
 	}
 	n := int(hdr[1])<<8 | int(hdr[2])
 	if n > maxFrameBytes {
-		return fmt.Errorf("interleaved frame too large: %d", n)
+		return nil, fmt.Errorf("interleaved frame too large: %d", n)
 	}
 	buf := make([]byte, n)
-	_, err := io.ReadFull(r, buf)
-	return err
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return &frame{channel: hdr[0], payload: buf}, nil
 }
 
 func readRequestHead(r *bufio.Reader, first byte) (*Request, error) {

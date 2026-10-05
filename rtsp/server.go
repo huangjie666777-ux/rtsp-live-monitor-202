@@ -25,10 +25,13 @@ const (
 
 // Server is an RTSP 1.0 server over TCP (interleaved RTP/AVP/TCP only).
 type Server struct {
-	src *media.Source
+	src  *media.Source
+	live *liveRegistry
 }
 
-func NewServer(src *media.Source) *Server { return &Server{src: src} }
+func NewServer(src *media.Source) *Server {
+	return &Server{src: src, live: newLiveRegistry()}
+}
 
 func (s *Server) ListenAndServe(addr string) error {
 	ln, err := net.Listen("tcp", addr)
@@ -54,6 +57,7 @@ type clientConn struct {
 	closed  chan struct{}
 	closeMu sync.Once
 	sess    *Session
+	pub     *liveSource // announced on this connection, nil otherwise
 }
 
 func newClientConn(conn net.Conn, srv *Server) *clientConn {
@@ -63,7 +67,9 @@ func newClientConn(conn net.Conn, srv *Server) *clientConn {
 func (c *clientConn) close() {
 	c.closeMu.Do(func() {
 		close(c.closed)
-		c.conn.Close()
+		if c.conn != nil {
+			c.conn.Close()
+		}
 	})
 }
 
@@ -74,12 +80,16 @@ func (c *clientConn) serve() {
 	}()
 	r := bufio.NewReader(c.conn)
 	for {
-		req, err := readRequest(r)
+		req, fr, err := readMessage(r)
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
 				log.Printf("[%s] read: %v", c.conn.RemoteAddr(), err)
 			}
 			return
+		}
+		if fr != nil {
+			c.handleFrame(fr)
+			continue
 		}
 		if err := c.handle(req); err != nil {
 			log.Printf("[%s] handle %s: %v", c.conn.RemoteAddr(), req.Method, err)
@@ -128,31 +138,38 @@ func (c *clientConn) fail(req *Request, code int, reason string) error {
 	return c.respond(req, code, reason, nil, "")
 }
 
-// resourceOK checks the request targets rtsp://host[:port]/demo.
-func resourceOK(uri string) bool {
+const publicMethods = "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, RECORD, ANNOUNCE, TEARDOWN"
+
+// uriPath extracts the path of an rtsp://host[:port]/path URI.
+func uriPath(uri string) (string, bool) {
 	u := strings.TrimPrefix(uri, "rtsp://")
 	if u == uri {
-		return false
+		return "", false
 	}
 	if i := strings.IndexByte(u, '/'); i >= 0 {
-		u = u[i:]
-	} else {
-		return false
+		return u[i:], true
 	}
-	return u == resourcePath || u == resourcePath+"/"+trackControl
+	return "", false
 }
 
 func (c *clientConn) handle(req *Request) error {
 	if req.CSeq() == "" {
 		return c.fail(req, 400, "Bad Request")
 	}
-	if !resourceOK(req.URI) {
+	path, ok := uriPath(req.URI)
+	if !ok {
+		return c.fail(req, 404, "Not Found")
+	}
+	if name, track, isLive := parseLivePath(path); isLive {
+		return c.handleLive(req, name, track)
+	}
+	if path != resourcePath && path != resourcePath+"/"+trackControl {
 		return c.fail(req, 404, "Not Found")
 	}
 	switch req.Method {
 	case "OPTIONS":
 		return c.respond(req, 200, "OK", map[string]string{
-			"Public": "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN",
+			"Public": publicMethods,
 		}, "")
 	case "DESCRIBE":
 		return c.handleDescribe(req)
@@ -245,7 +262,7 @@ func parseRange(h string) (float64, bool) {
 
 func (c *clientConn) handlePlay(req *Request) error {
 	s := c.sess
-	if s == nil || (req.Header("session") != "" && req.Header("session") != s.ID) {
+	if s == nil || req.Header("session") != s.ID {
 		return c.fail(req, 454, "Session Not Found")
 	}
 	s.mu.Lock()
@@ -293,7 +310,7 @@ func (c *clientConn) handlePlay(req *Request) error {
 
 func (c *clientConn) handlePause(req *Request) error {
 	s := c.sess
-	if s == nil || (req.Header("session") != "" && req.Header("session") != s.ID) {
+	if s == nil || req.Header("session") != s.ID {
 		return c.fail(req, 454, "Session Not Found")
 	}
 	s.mu.Lock()
@@ -318,7 +335,7 @@ func (c *clientConn) handlePause(req *Request) error {
 
 func (c *clientConn) handleTeardown(req *Request) error {
 	s := c.sess
-	if s == nil || (req.Header("session") != "" && req.Header("session") != s.ID) {
+	if s == nil || req.Header("session") != s.ID {
 		return c.fail(req, 454, "Session Not Found")
 	}
 	c.teardownSession()
@@ -326,17 +343,225 @@ func (c *clientConn) handleTeardown(req *Request) error {
 }
 
 func (c *clientConn) teardownSession() {
+	if s := c.sess; s != nil {
+		s.mu.Lock()
+		st := s.stream
+		s.stream = nil
+		l := s.listener
+		s.listener = nil
+		src := s.live
+		mode := s.mode
+		s.state = stateInit
+		s.mu.Unlock()
+		if st != nil {
+			st.stopAndWait()
+		}
+		if l != nil {
+			src.removeListener(l)
+			l.stopAndWait()
+		}
+		if mode == modeRecord && src != nil {
+			// Publisher gone: remove the source and disconnect its
+			// listeners. remove() only deletes the registry entry if
+			// this source still owns the name.
+			src.close()
+		}
+		c.sess = nil
+	}
+	if c.pub != nil {
+		// Announced but never RECORDed (or already closed above).
+		c.pub.close()
+		c.pub = nil
+	}
+}
+
+// handleLive routes requests for /live/<name> resources.
+func (c *clientConn) handleLive(req *Request, name string, track bool) error {
+	switch req.Method {
+	case "OPTIONS":
+		return c.respond(req, 200, "OK", map[string]string{
+			"Public": publicMethods,
+		}, "")
+	case "ANNOUNCE":
+		if track {
+			return c.fail(req, 404, "Not Found")
+		}
+		return c.handleAnnounce(req, name)
+	case "DESCRIBE":
+		return c.handleLiveDescribe(req, name)
+	case "SETUP":
+		return c.handleLiveSetup(req, name, track)
+	case "RECORD":
+		return c.handleRecord(req)
+	case "PLAY":
+		return c.handleLivePlay(req)
+	case "PAUSE":
+		return c.handleLivePause(req)
+	case "TEARDOWN":
+		return c.handleTeardown(req)
+	default:
+		return c.fail(req, 405, "Method Not Allowed")
+	}
+}
+
+func (c *clientConn) handleLiveDescribe(req *Request, name string) error {
+	src := c.srv.live.get(name)
+	if src == nil || !src.isRecording() {
+		// Listening opens only after RECORD succeeded.
+		return c.fail(req, 404, "Not Found")
+	}
+	body := "v=0\r\n" +
+		"o=- 0 0 IN IP4 0.0.0.0\r\n" +
+		"s=rtsprelay202 live " + name + "\r\n" +
+		"t=0 0\r\n" +
+		"a=range:npt=0-\r\n" +
+		"m=audio 0 RTP/AVP 0\r\n" +
+		"c=IN IP4 0.0.0.0\r\n" +
+		"a=rtpmap:0 PCMU/8000/1\r\n" +
+		"a=control:" + trackControl + "\r\n"
+	return c.respond(req, 200, "OK", map[string]string{
+		"Content-Base": req.URI,
+	}, body)
+}
+
+// parseTransportSpec parses the first Transport spec, requiring
+// RTP/AVP/TCP, unicast and two distinct interleaved channels.
+func parseTransportSpec(tr string) (rtpCh, rtcpCh int, mode string, ok bool) {
+	spec := strings.Split(tr, ",")[0]
+	parts := strings.Split(spec, ";")
+	if !strings.EqualFold(strings.TrimSpace(parts[0]), "RTP/AVP/TCP") {
+		return 0, 0, "", false
+	}
+	rtpCh, rtcpCh = -1, -1
+	unicast := false
+	for _, p := range parts[1:] {
+		p = strings.TrimSpace(p)
+		if strings.EqualFold(p, "unicast") {
+			unicast = true
+		}
+		if v, is := strings.CutPrefix(strings.ToLower(p), "interleaved="); is {
+			fmt.Sscanf(v, "%d-%d", &rtpCh, &rtcpCh)
+		}
+		if v, is := strings.CutPrefix(strings.ToLower(p), "mode="); is {
+			mode = strings.Trim(strings.ToLower(v), "\"")
+		}
+	}
+	if !unicast || rtpCh < 0 || rtcpCh < 0 || rtpCh == rtcpCh || rtpCh > 255 || rtcpCh > 255 {
+		return 0, 0, "", false
+	}
+	return rtpCh, rtcpCh, mode, true
+}
+
+func (c *clientConn) handleLiveSetup(req *Request, name string, track bool) error {
+	if c.sess != nil && c.sess.State() != stateInit && c.sess.State() != stateReady {
+		return c.fail(req, 459, "Aggregate Operation Not Allowed")
+	}
+	tr := req.Header("transport")
+	if tr == "" {
+		return c.fail(req, 400, "Bad Request")
+	}
+	rtpCh, rtcpCh, mode, ok := parseTransportSpec(tr)
+	if !ok {
+		return c.fail(req, 461, "Unsupported Transport")
+	}
+
+	var src *liveSource
+	sessMode := modePlay
+	if mode == "record" {
+		// Publisher: must have ANNOUNCEd this exact name first.
+		if !track || c.pub == nil || c.pub.name != name {
+			return c.fail(req, 400, "Bad Request")
+		}
+		src = c.pub
+		sessMode = modeRecord
+	} else {
+		// Listener: the source must already be recording.
+		src = c.srv.live.get(name)
+		if src == nil || !src.isRecording() {
+			return c.fail(req, 404, "Not Found")
+		}
+	}
+
+	if c.sess == nil {
+		c.sess = newSession()
+	}
 	s := c.sess
-	if s == nil {
-		return
+	s.mu.Lock()
+	s.mode = sessMode
+	s.live = src
+	s.rtpChannel, s.rtcpChannel = rtpCh, rtcpCh
+	s.state = stateReady
+	s.mu.Unlock()
+
+	transport := fmt.Sprintf("RTP/AVP/TCP;unicast;interleaved=%d-%d", rtpCh, rtcpCh)
+	if sessMode == modeRecord {
+		transport += ";mode=\"record\""
+	}
+	return c.respond(req, 200, "OK", map[string]string{
+		"Transport": transport,
+	}, "")
+}
+
+func (c *clientConn) handleLivePlay(req *Request) error {
+	s := c.sess
+	if s == nil || req.Header("session") != s.ID {
+		return c.fail(req, 454, "Session Not Found")
+	}
+	if req.Header("range") != "" {
+		return c.fail(req, 457, "Invalid Range") // live sources have no seek
 	}
 	s.mu.Lock()
-	st := s.stream
-	s.stream = nil
-	s.state = stateInit
-	s.mu.Unlock()
-	if st != nil {
-		st.stopAndWait()
+	if s.mode != modePlay || s.live == nil || s.state != stateReady {
+		s.mu.Unlock()
+		return c.fail(req, 455, "Method Not Valid in This State")
 	}
-	c.sess = nil
+	l := newLiveListener(s.live, c, s)
+	if !s.live.addListener(l) {
+		s.mu.Unlock()
+		return c.fail(req, 404, "Not Found")
+	}
+	s.listener = l
+	s.state = statePlaying
+	seq, ts := s.seq, s.rtpTime
+	s.mu.Unlock()
+
+	err := c.respond(req, 200, "OK", map[string]string{
+		"Range": "npt=0-",
+		"RTP-Info": fmt.Sprintf("url=%s;seq=%d;rtptime=%d",
+			strings.TrimSuffix(req.URI, "/"+trackControl)+"/"+trackControl, seq, ts),
+	}, "")
+	if err != nil {
+		return err
+	}
+	// The PLAY response is sent strictly before the first RTP packet.
+	go l.run()
+	return nil
+}
+
+func (c *clientConn) handleLivePause(req *Request) error {
+	s := c.sess
+	if s == nil || req.Header("session") != s.ID {
+		return c.fail(req, 454, "Session Not Found")
+	}
+	s.mu.Lock()
+	if s.mode != modePlay || s.state != statePlaying {
+		s.mu.Unlock()
+		return c.fail(req, 455, "Method Not Valid in This State")
+	}
+	l := s.listener
+	s.listener = nil
+	src := s.live
+	s.state = stateReady
+	s.mu.Unlock()
+
+	// Respond first, then stop delivery and drop any queued packets, so a
+	// resumed PLAY only receives newly published audio.
+	if err := c.respond(req, 200, "OK", nil, ""); err != nil {
+		return err
+	}
+	if l != nil {
+		src.removeListener(l)
+		l.stopAndWait()
+	}
+	return nil
 }

@@ -64,3 +64,74 @@ RTP packets/s on the client's interleaved channel 0, PLAY-while-playing
 rejection (455), PAUSE silence, gapless resume, seek with
 `Range: npt=2.007-` aligned to 2.000, invalid range (457), wrong session
 (454), client-to-server RTCP `$` frame skipping, and TEARDOWN.
+
+## Live publishing and listening (`/live/<name>`)
+
+Device microphone audio can be published in real time and fanned out to
+any number of diagnostic listeners. `/demo` file playback is unaffected.
+
+### Publishing
+
+- `ANNOUNCE rtsp://<host>:<port>/live/<name>` with an `application/sdp`
+  body. `<name>` is 1-32 letters, digits or underscores; a second
+  publisher with the same name gets `409 Conflict`. The SDP must describe
+  exactly one track: `m=audio ... RTP/AVP 0`, `a=rtpmap:0 PCMU/8000/1`,
+  `a=control:trackID=0` (`400` otherwise).
+- `SETUP .../live/<name>/trackID=0` with
+  `Transport: RTP/AVP/TCP;unicast;interleaved=<rtp>-<rtcp>;mode="record"`
+  (two distinct channels, `461` otherwise).
+- `RECORD` opens the stream for listeners. From then on the publisher
+  writes interleaved `$` frames on the negotiated RTP channel: RTP v2
+  packets (CSRC, extension headers and padding are parsed) with exactly
+  160 bytes of PCMU payload (20 ms). Invalid frames are dropped, RTCP is
+  skipped, and RTSP control requests on the same connection keep working.
+  Nothing is written to disk or transcoded.
+- `TEARDOWN` or disconnect removes the source and closes all its
+  listener connections; the name can immediately be re-published. Stale
+  cleanup of an old session never removes a newer source with the same
+  name (`rtsp/live.go` `liveRegistry.remove` compares ownership).
+
+### Listening
+
+- `DESCRIBE` / `SETUP` / `PLAY` on `/live/<name>` work only after
+  `RECORD` succeeded (`404` before). Listeners pick their own interleaved
+  channels. The `PLAY` response is sent strictly before the first RTP
+  packet; live sources reject `Range` with `457`.
+- Every listener gets an independent SSRC, continuous sequence numbers
+  and timestamps incrementing by 160 per packet; payloads are forwarded
+  unchanged, packet for packet.
+- `PAUSE` stops delivery and drops queued packets; resuming `PLAY` only
+  receives newly published audio.
+- Each listener has a 64-packet queue. A full queue or a write timeout
+  disconnects only that slow listener — the publisher and other
+  listeners are never blocked.
+
+### Session requirement
+
+PLAY / PAUSE / RECORD / TEARDOWN now require a matching `Session`
+header; requests without one (or with an unknown id) get
+`454 Session Not Found`.
+
+### Code map (live path)
+
+- `rtsp/request.go` — `readMessage` splits the connection into RTSP
+  requests and interleaved `$` frames (`readRequest` kept for tests).
+- `rtsp/publish.go` — name/SDP validation, `ANNOUNCE`/`RECORD` handlers,
+  publisher frame parsing and broadcast entry point.
+- `rtsp/live.go` — `liveRegistry` (name ownership), `liveSource`
+  (recording state, fan-out, teardown) and `liveListener` (64-packet
+  queue, per-listener RTP packetizer).
+- `rtsp/session.go` — session mode (play/record) and live attachments.
+- `rtsp/server.go` — `/live/<name>` routing, listener
+  DESCRIBE/SETUP/PLAY/PAUSE, session-required fix, cleanup.
+- `rtsp/live_test.go` — unit tests for the above.
+
+### Live demo client
+
+    go build -o bin/rtspdemo ./client
+    ./bin/rtspdemo -live 127.0.0.1:8554
+
+Runs one publisher (ANNOUNCE/SETUP record/RECORD, 100 RTP packets) and
+two listeners on different interleaved channels; both verify payload
+content, sequence continuity and +160 timestamps, then the publisher
+TEARDOWN closes both listener connections.
