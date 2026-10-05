@@ -1,0 +1,10 @@
+vendor/
+.env
+.env.*
+*.key
+*.pem
+*.log
+.cache/
+build/
+bin/
+coverage*
