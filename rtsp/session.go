@@ -15,6 +15,14 @@ const (
 	statePlaying
 )
 
+type sessionKind int
+
+const (
+	kindDemo      sessionKind = iota // /demo file playback
+	kindListener                     // /live/<name> listener
+	kindPublisher                    // /live/<name> publisher
+)
+
 func (s sessionState) String() string {
 	switch s {
 	case stateReady:
@@ -30,6 +38,7 @@ type Session struct {
 	ID string
 
 	mu          sync.Mutex
+	kind        sessionKind
 	state       sessionState
 	rtpChannel  int
 	rtcpChannel int
@@ -41,6 +50,8 @@ type Session struct {
 
 	pos     int // file cursor in samples
 	stream  *streamer
+	live    *liveSource // publisher: owned source; listener: subscribed source
+	liveW   *liveWriter // listener only
 	onClose func()
 }
 

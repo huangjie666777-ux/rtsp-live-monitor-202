@@ -17,18 +17,24 @@ import (
 )
 
 const (
-	resourcePath = "/demo"
+	demoPath     = "/demo"
+	livePrefix   = "/live/"
 	trackControl = "trackID=0"
 	writeTimeout = 5 * time.Second
 	serverName   = "rtsprelay202/1.0"
 )
 
 // Server is an RTSP 1.0 server over TCP (interleaved RTP/AVP/TCP only).
+// It serves the /demo file stream and any number of /live/<name>
+// published streams.
 type Server struct {
-	src *media.Source
+	src  *media.Source
+	live *registry
 }
 
-func NewServer(src *media.Source) *Server { return &Server{src: src} }
+func NewServer(src *media.Source) *Server {
+	return &Server{src: src, live: newRegistry()}
+}
 
 func (s *Server) ListenAndServe(addr string) error {
 	ln, err := net.Listen("tcp", addr)
@@ -54,6 +60,10 @@ type clientConn struct {
 	closed  chan struct{}
 	closeMu sync.Once
 	sess    *Session
+
+	// Publisher state: live source announced on this connection.
+	pubName string
+	pubSrc  *liveSource
 }
 
 func newClientConn(conn net.Conn, srv *Server) *clientConn {
@@ -70,16 +80,23 @@ func (c *clientConn) close() {
 func (c *clientConn) serve() {
 	defer func() {
 		c.teardownSession()
+		c.releasePublisher()
 		c.close()
 	}()
 	r := bufio.NewReader(c.conn)
 	for {
-		req, err := readRequest(r)
+		req, frame, err := readMessage(r)
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
 				log.Printf("[%s] read: %v", c.conn.RemoteAddr(), err)
 			}
 			return
+		}
+		if frame != nil {
+			// Interleaved RTP from a publisher is distributed;
+			// anything else (e.g. RTCP) is skipped.
+			c.handleFrame(frame)
+			continue
 		}
 		if err := c.handle(req); err != nil {
 			log.Printf("[%s] handle %s: %v", c.conn.RemoteAddr(), req.Method, err)
@@ -128,45 +145,97 @@ func (c *clientConn) fail(req *Request, code int, reason string) error {
 	return c.respond(req, code, reason, nil, "")
 }
 
-// resourceOK checks the request targets rtsp://host[:port]/demo.
-func resourceOK(uri string) bool {
+// requestPath extracts the path of an rtsp://host[:port]/... URI.
+func requestPath(uri string) (string, bool) {
 	u := strings.TrimPrefix(uri, "rtsp://")
 	if u == uri {
-		return false
+		return "", false
 	}
-	if i := strings.IndexByte(u, '/'); i >= 0 {
-		u = u[i:]
-	} else {
-		return false
+	i := strings.IndexByte(u, '/')
+	if i < 0 {
+		return "", false
 	}
-	return u == resourcePath || u == resourcePath+"/"+trackControl
+	return u[i:], true
+}
+
+// liveName returns the stream name for /live/<name> (track=false) or
+// /live/<name>/trackID=0 (track=true) paths.
+func liveName(path string) (name string, track bool, ok bool) {
+	rest, found := strings.CutPrefix(path, livePrefix)
+	if !found || rest == "" {
+		return "", false, false
+	}
+	if !strings.Contains(rest, "/") {
+		return rest, false, true
+	}
+	base, suffix, _ := strings.Cut(rest, "/")
+	if base == "" || suffix != trackControl {
+		return "", false, false
+	}
+	return base, true, true
 }
 
 func (c *clientConn) handle(req *Request) error {
 	if req.CSeq() == "" {
 		return c.fail(req, 400, "Bad Request")
 	}
-	if !resourceOK(req.URI) {
+	path, ok := requestPath(req.URI)
+	if !ok {
 		return c.fail(req, 404, "Not Found")
 	}
+	name, _, isLive := liveName(path)
+
 	switch req.Method {
 	case "OPTIONS":
 		return c.respond(req, 200, "OK", map[string]string{
-			"Public": "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN",
+			"Public": "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, ANNOUNCE, RECORD",
 		}, "")
+	case "ANNOUNCE":
+		if !isLive || strings.Contains(strings.TrimPrefix(path, livePrefix), "/") {
+			return c.fail(req, 404, "Not Found")
+		}
+		return c.handleAnnounce(req, name)
 	case "DESCRIBE":
-		return c.handleDescribe(req)
+		if path == demoPath {
+			return c.handleDescribe(req)
+		}
+		if isLive && !strings.Contains(strings.TrimPrefix(path, livePrefix), "/") {
+			return c.handleLiveDescribe(req, name)
+		}
+		return c.fail(req, 404, "Not Found")
 	case "SETUP":
-		return c.handleSetup(req)
+		if path == demoPath+"/"+trackControl {
+			return c.handleSetup(req)
+		}
+		if isLive && strings.HasSuffix(path, "/"+trackControl) {
+			if c.pubSrc != nil && c.pubName == name {
+				return c.handlePublishSetup(req, name)
+			}
+			return c.handleLiveSetup(req, name)
+		}
+		return c.fail(req, 404, "Not Found")
 	case "PLAY":
 		return c.handlePlay(req)
 	case "PAUSE":
 		return c.handlePause(req)
 	case "TEARDOWN":
 		return c.handleTeardown(req)
+	case "RECORD":
+		return c.handleRecord(req)
 	default:
 		return c.fail(req, 405, "Method Not Allowed")
 	}
+}
+
+// requireSession returns the connection session when the request carries
+// a matching Session header. Control methods (PLAY/PAUSE/TEARDOWN/RECORD)
+// must not run without it.
+func (c *clientConn) requireSession(req *Request) *Session {
+	s := c.sess
+	if s == nil || req.Header("session") != s.ID {
+		return nil
+	}
+	return s
 }
 
 func (c *clientConn) handleDescribe(req *Request) error {
@@ -187,31 +256,43 @@ func (c *clientConn) handleDescribe(req *Request) error {
 	}, body)
 }
 
-func (c *clientConn) handleSetup(req *Request) error {
-	if c.sess != nil && c.sess.State() == statePlaying {
-		return c.fail(req, 459, "Aggregate Operation Not Allowed")
-	}
-	tr := req.Header("transport")
+// parseTransport parses one RTP/AVP/TCP;unicast;interleaved=a-b[;mode=...]
+// transport spec.
+func parseTransport(tr string) (rtpCh, rtcpCh int, mode string, ok bool) {
 	if tr == "" {
-		return c.fail(req, 400, "Bad Request")
+		return 0, 0, "", false
 	}
 	spec := strings.Split(tr, ",")[0]
 	parts := strings.Split(spec, ";")
 	if !strings.EqualFold(strings.TrimSpace(parts[0]), "RTP/AVP/TCP") {
-		return c.fail(req, 461, "Unsupported Transport")
+		return 0, 0, "", false
 	}
-	rtpCh, rtcpCh := -1, -1
+	rtpCh, rtcpCh = -1, -1
 	unicast := false
 	for _, p := range parts[1:] {
 		p = strings.TrimSpace(p)
-		if strings.EqualFold(p, "unicast") {
+		switch {
+		case strings.EqualFold(p, "unicast"):
 			unicast = true
-		}
-		if v, ok := strings.CutPrefix(strings.ToLower(p), "interleaved="); ok {
+		case strings.HasPrefix(strings.ToLower(p), "interleaved="):
+			v := p[len("interleaved="):]
 			fmt.Sscanf(v, "%d-%d", &rtpCh, &rtcpCh)
+		case strings.HasPrefix(strings.ToLower(p), "mode="):
+			mode = p[len("mode="):]
 		}
 	}
 	if !unicast || rtpCh < 0 || rtcpCh < 0 || rtpCh == rtcpCh || rtpCh > 255 || rtcpCh > 255 {
+		return 0, 0, "", false
+	}
+	return rtpCh, rtcpCh, mode, true
+}
+
+func (c *clientConn) handleSetup(req *Request) error {
+	if c.sess != nil && c.sess.State() == statePlaying {
+		return c.fail(req, 459, "Aggregate Operation Not Allowed")
+	}
+	rtpCh, rtcpCh, _, ok := parseTransport(req.Header("transport"))
+	if !ok {
 		return c.fail(req, 461, "Unsupported Transport")
 	}
 
@@ -220,6 +301,7 @@ func (c *clientConn) handleSetup(req *Request) error {
 	}
 	s := c.sess
 	s.mu.Lock()
+	s.kind = kindDemo
 	s.rtpChannel, s.rtcpChannel = rtpCh, rtcpCh
 	s.state = stateReady
 	s.mu.Unlock()
@@ -244,10 +326,23 @@ func parseRange(h string) (float64, bool) {
 }
 
 func (c *clientConn) handlePlay(req *Request) error {
-	s := c.sess
-	if s == nil || (req.Header("session") != "" && req.Header("session") != s.ID) {
+	s := c.requireSession(req)
+	if s == nil {
 		return c.fail(req, 454, "Session Not Found")
 	}
+	s.mu.Lock()
+	kind := s.kind
+	s.mu.Unlock()
+	if kind == kindListener {
+		return c.handleLivePlay(req, s)
+	}
+	if kind != kindDemo {
+		return c.fail(req, 455, "Method Not Valid in This State")
+	}
+	return c.handleDemoPlay(req, s)
+}
+
+func (c *clientConn) handleDemoPlay(req *Request, s *Session) error {
 	s.mu.Lock()
 	if s.state != stateReady {
 		s.mu.Unlock()
@@ -292,8 +387,8 @@ func (c *clientConn) handlePlay(req *Request) error {
 }
 
 func (c *clientConn) handlePause(req *Request) error {
-	s := c.sess
-	if s == nil || (req.Header("session") != "" && req.Header("session") != s.ID) {
+	s := c.requireSession(req)
+	if s == nil {
 		return c.fail(req, 454, "Session Not Found")
 	}
 	s.mu.Lock()
@@ -306,19 +401,22 @@ func (c *clientConn) handlePause(req *Request) error {
 	s.state = stateReady
 	s.mu.Unlock()
 
-	// Respond first, then stop packets; the sample position is kept.
+	// Respond first, then stop packets.
 	if err := c.respond(req, 200, "OK", nil, ""); err != nil {
 		return err
 	}
 	if st != nil {
 		st.stopAndWait()
 	}
+	// Listener: drop the subscription and any queued packets, so a
+	// resumed PLAY only delivers newly arrived audio.
+	liveSessionCleanup(s)
 	return nil
 }
 
 func (c *clientConn) handleTeardown(req *Request) error {
-	s := c.sess
-	if s == nil || (req.Header("session") != "" && req.Header("session") != s.ID) {
+	s := c.requireSession(req)
+	if s == nil {
 		return c.fail(req, 454, "Session Not Found")
 	}
 	c.teardownSession()
@@ -337,6 +435,10 @@ func (c *clientConn) teardownSession() {
 	s.mu.Unlock()
 	if st != nil {
 		st.stopAndWait()
+	}
+	liveSessionCleanup(s)
+	if s.kind == kindPublisher {
+		c.releasePublisher()
 	}
 	c.sess = nil
 }

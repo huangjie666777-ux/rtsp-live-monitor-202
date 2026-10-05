@@ -24,6 +24,12 @@ type Request struct {
 	Body    []byte
 }
 
+// Frame is an interleaved '$' binary frame (RTP or RTCP over TCP).
+type Frame struct {
+	Channel byte
+	Payload []byte
+}
+
 func (r *Request) Header(name string) string {
 	return r.Headers[strings.ToLower(name)]
 }
@@ -35,33 +41,56 @@ func (r *Request) CSeq() string { return r.Header("cseq") }
 // and Content-Length bodies are handled without breaking message boundaries.
 func readRequest(r *bufio.Reader) (*Request, error) {
 	for {
-		b, err := r.ReadByte()
+		req, frame, err := readMessage(r)
 		if err != nil {
 			return nil, err
 		}
-		if b == '$' {
-			if err := skipInterleavedFrame(r); err != nil {
-				return nil, err
-			}
+		if frame != nil {
 			continue
 		}
-		return readRequestHead(r, b)
+		return req, nil
 	}
 }
 
-// skipInterleavedFrame consumes one '$' <channel> <len:2> <payload> frame.
-func skipInterleavedFrame(r *bufio.Reader) error {
+// readMessage reads the next message on the connection: either an RTSP
+// request or one interleaved '$' frame. Exactly one of the returned
+// values is non-nil.
+func readMessage(r *bufio.Reader) (*Request, *Frame, error) {
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return nil, nil, err
+		}
+		if b == '$' {
+			frame, err := readInterleavedFrame(r)
+			if err != nil {
+				return nil, nil, err
+			}
+			return nil, frame, nil
+		}
+		req, err := readRequestHead(r, b)
+		if err != nil {
+			return nil, nil, err
+		}
+		return req, nil, nil
+	}
+}
+
+// readInterleavedFrame consumes one '$' <channel> <len:2> <payload> frame.
+func readInterleavedFrame(r *bufio.Reader) (*Frame, error) {
 	hdr := make([]byte, 3)
 	if _, err := io.ReadFull(r, hdr); err != nil {
-		return err
+		return nil, err
 	}
 	n := int(hdr[1])<<8 | int(hdr[2])
 	if n > maxFrameBytes {
-		return fmt.Errorf("interleaved frame too large: %d", n)
+		return nil, fmt.Errorf("interleaved frame too large: %d", n)
 	}
 	buf := make([]byte, n)
-	_, err := io.ReadFull(r, buf)
-	return err
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return &Frame{Channel: hdr[0], Payload: buf}, nil
 }
 
 func readRequestHead(r *bufio.Reader, first byte) (*Request, error) {

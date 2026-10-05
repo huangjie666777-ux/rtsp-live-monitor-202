@@ -23,7 +23,7 @@ func main() {
 
 	srv := rtsp.NewServer(src)
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("RTSP listening on %s, resource /demo", addr)
+	log.Printf("RTSP listening on %s, resources /demo and /live/<name>", addr)
 	if err := srv.ListenAndServe(addr); err != nil {
 		log.Printf("server stopped: %v", err)
 		os.Exit(1)
